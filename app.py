@@ -1,140 +1,120 @@
 """
-MedCompare lightweight backend.
+MedCompare backend — LIVE medicine price lookup.
 
 Exposes POST /api/scrape expected by the front-end. Returns a JSON object
-keyed by pharmacy/website name. Each value is a list of product objects with
-the fields the front-end renders: number, medicine, quantity, price, link.
+keyed by source name. Each value is a list of product objects with the fields
+the front-end renders: number, medicine, quantity, price, link.
 
-Design:
-- Avoids Selenium/headless Chrome (which caused HTTP 503 out-of-memory
-  failures on constrained hosting).
-- Responds to ANY search query. A curated catalog is used for well-known
-  medicines; for anything else, realistic results are generated
-  deterministically from the query so that:
-    * different queries produce different results, and
-    * the same query always produces the same results.
+Live data source:
+- Tata 1mg public search API (https://www.1mg.com/pwa-api/...). This returns
+  REAL, current product names, pack sizes, prices and product URLs. It works
+  with plain HTTP requests (no headless browser), which keeps the service
+  light enough to run on constrained hosting.
+
+Note on other pharmacies:
+- Apollo and Netmeds render prices client-side via JavaScript and do not
+  expose a simple public price API, so they cannot be scraped reliably with
+  lightweight requests. Rather than show fake numbers, this backend returns
+  live 1mg data only. The response is keyed by "1mg (Tata)".
 """
 
 import os
-import hashlib
-from urllib.parse import quote_plus
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-WEBSITES = ["Apollo", "Netmeds", "1mg"]
+ONEMG_SEARCH_URL = "https://www.1mg.com/pwa-api/api/v4/search/all"
+ONEMG_BASE = "https://www.1mg.com"
+DEFAULT_CITY = os.environ.get("ONEMG_CITY", "Gurgaon")
+REQUEST_TIMEOUT = 20
 
-# Per-site base URLs for building product search links.
-SITE_SEARCH_URLS = {
-    "Apollo": "https://www.apollopharmacy.in/search-medicines/{q}",
-    "Netmeds": "https://www.netmeds.com/catalogsearch/result/{q}/all",
-    "1mg": "https://www.1mg.com/search/all?name={q}",
+SOURCE_NAME = "1mg (Tata)"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
 }
 
-# Small relative price multiplier per site to make prices differ realistically.
-SITE_PRICE_FACTOR = {"Apollo": 1.00, "Netmeds": 1.04, "1mg": 0.96}
 
-# Curated catalog for well-known medicines (nice, realistic data).
-CATALOG = {
-    "paracetamol": [("Dolo 650 Tablet", "15 Tablets", 30.0),
-                    ("Crocin Advance Tablet", "15 Tablets", 28.0),
-                    ("Calpol 500 Tablet", "15 Tablets", 16.5)],
-    "azithromycin": [("Azithral 500 Tablet", "5 Tablets", 118.0),
-                     ("Azee 500 Tablet", "3 Tablets", 95.0)],
-    "amoxicillin": [("Augmentin 625 Duo Tablet", "10 Tablets", 205.0),
-                    ("Mox 500 Capsule", "15 Capsules", 78.0)],
-    "pantoprazole": [("Pan 40 Tablet", "10 Tablets", 134.0),
-                     ("Pantop 40 Tablet", "15 Tablets", 120.0)],
-    "cetirizine": [("Cetirizine 10 Tablet", "10 Tablets", 24.0),
-                   ("Alerid 10 Tablet", "10 Tablets", 29.0)],
-    "metformin": [("Metformin 500 Tablet", "20 Tablets", 18.0),
-                  ("Glycomet 500 Tablet", "20 Tablets", 22.0)],
-    "ibuprofen": [("Brufen 400 Tablet", "15 Tablets", 32.0),
-                  ("Combiflam Tablet", "20 Tablets", 44.0)],
-    "omeprazole": [("Omez 20 Capsule", "15 Capsules", 52.0),
-                   ("Omeprazole 20 Capsule", "10 Capsules", 40.0)],
-}
+def fetch_1mg(query: str, limit: int = 10):
+    """Fetch real products with prices from the 1mg public search API."""
+    headers = dict(HEADERS)
+    headers["X-City"] = DEFAULT_CITY
+    params = {
+        "q": query,
+        "page_number": 1,
+        "per_page": limit,
+        "types[]": ["allopathy", "sku"],
+        "city": DEFAULT_CITY,
+    }
+    resp = requests.get(
+        ONEMG_SEARCH_URL, headers=headers, params=params, timeout=REQUEST_TIMEOUT
+    )
+    resp.raise_for_status()
+    payload = resp.json()
 
-# Common dosage forms used when generating results for unknown queries.
-FORMS = [("Tablet", "15 Tablets"), ("Tablet", "10 Tablets"),
-         ("Capsule", "10 Capsules"), ("Syrup", "100 ml Bottle")]
+    results = []
+    search_results = (payload.get("data") or {}).get("search_results") or []
+    number = 0
+    for item in search_results:
+        if item.get("type") != "drug":
+            continue
 
+        prices = item.get("prices") or {}
+        # Prefer the actual selling (discounted) price; fall back to MRP.
+        price = prices.get("discounted_price") or prices.get("mrp")
+        if not price:
+            continue
 
-def _seed(text: str) -> int:
-    """Stable integer seed derived from a string (deterministic per query)."""
-    return int(hashlib.md5(text.encode("utf-8")).hexdigest(), 16)
+        name = (item.get("name") or "").replace("<b>", "").replace("</b>", "").strip()
+        if not name:
+            continue
 
+        qinfo = item.get("quantity_info") or {}
+        sell_qty = qinfo.get("selling_quantity")
+        quantity = f"{sell_qty} units" if sell_qty else "1 unit"
 
-def _format_price(value: float) -> str:
-    return f"\u20b9{value:.2f}"  # ₹ + 2 decimals
+        url_path = item.get("url") or ""
+        link = (ONEMG_BASE + url_path) if url_path.startswith("/") else (url_path or ONEMG_BASE)
 
+        number += 1
+        results.append(
+            {
+                "number": number,
+                "medicine": name,
+                "quantity": quantity,
+                "price": str(price),
+                "link": link,
+            }
+        )
 
-def _link(site: str, query: str) -> str:
-    return SITE_SEARCH_URLS[site].format(q=quote_plus(query))
-
-
-def _base_products(query: str):
-    """
-    Return a list of (medicine_name, quantity, base_price) tuples for the query.
-    Uses the curated catalog when possible; otherwise generates deterministic
-    but realistic entries from the query itself.
-    """
-    q = (query or "").strip()
-    if not q:
-        return []
-
-    key = q.lower()
-
-    # Exact or partial match against the curated catalog.
-    for cat_key, items in CATALOG.items():
-        if cat_key in key or key in cat_key:
-            return items
-
-    # Generate deterministic results for any unknown query.
-    seed = _seed(key)
-    title = q.title()
-    num_products = 3 + (seed % 3)  # 3 to 5 products
-    products = []
-    for i in range(num_products):
-        s = _seed(f"{key}-{i}")
-        form, qty = FORMS[s % len(FORMS)]
-        strength = [100, 200, 250, 400, 500, 650][s % 6]
-        # Base price between ~15 and ~315, deterministic per query/index.
-        base_price = 15 + (s % 300) + ((s // 7) % 100) / 100.0
-        name = f"{title} {strength} {form}"
-        products.append((name, qty, round(base_price, 2)))
-    return products
+    return results
 
 
 def build_results(query: str) -> dict:
-    """Return results keyed by website for the given query."""
-    base = _base_products(query)
-    results = {site: [] for site in WEBSITES}
+    """Return results keyed by source for the given query."""
+    query = (query or "").strip()
+    if not query:
+        return {SOURCE_NAME: []}
 
-    if not base:
-        return results  # empty query -> empty object; UI shows "no results"
+    try:
+        products = fetch_1mg(query)
+    except requests.RequestException as exc:
+        # Surface a clean error the front-end can display.
+        return {"error": f"Live lookup failed: {exc}"}
 
-    link_query = query.strip()
-    for site in WEBSITES:
-        factor = SITE_PRICE_FACTOR[site]
-        for idx, (name, qty, base_price) in enumerate(base, start=1):
-            results[site].append(
-                {
-                    "number": idx,
-                    "medicine": name,
-                    "quantity": qty,
-                    "price": _format_price(base_price * factor),
-                    "link": _link(site, link_query),
-                }
-            )
-    return results
+    return {SOURCE_NAME: products}
 
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "medcompare-backend"})
+    return jsonify({"status": "ok", "service": "medcompare-backend", "source": SOURCE_NAME})
 
 
 @app.route("/api/scrape", methods=["POST"])
