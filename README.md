@@ -60,3 +60,14 @@ gunicorn app:app
 All sources are fetched with plain HTTP requests in parallel. The service
 intentionally avoids Selenium/headless Chrome, which caused out-of-memory
 failures (HTTP 503) on constrained hosting.
+
+The Apollo guest token lasts 12 hours. It is cached in memory, refreshed
+10 minutes before it expires, and fetched again if Apollo returns 401.
+
+## Troubleshooting
+- **Apollo shows `SSLError: CERTIFICATE_VERIFY_FAILED` when testing locally:**
+  a network firewall (for example Sophos on a college or office network) is
+  intercepting `apigateway.apollo247.in`. Test on a different network, such as
+  a mobile hotspot. The deployed Render service is not affected.
+- **One pharmacy returns an empty list:** that site was slow, down or changed its
+  API. The other pharmacies are still returned.
