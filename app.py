@@ -5,18 +5,23 @@ Exposes POST /api/scrape expected by the front-end. Returns a JSON object
 keyed by source name. Each value is a list of product objects with the fields
 the front-end renders: number, medicine, quantity, price, link.
 
-Live data sources (both return REAL current prices via plain HTTP requests,
+Live data sources (all return REAL current prices via plain HTTP requests,
 no headless browser required):
 - Tata 1mg public search API      (https://www.1mg.com/pwa-api/...)
 - PharmEasy public search API      (https://pharmeasy.in/api/search/...)
+- Netmeds public search API        (https://www.netmeds.com/ext/search/...)
 
-Apollo and Netmeds are intentionally not included: they gate their price
-APIs behind API keys / signed requests and render prices client-side, so they
-cannot be scraped reliably with lightweight requests. Rather than show fake
-numbers, only verified live sources are returned.
+Apollo Pharmacy: fetch_apollo() calls the search endpoint used by
+apollopharmacy.in's own search page. It is not registered in SOURCES until
+it has been verified from a network that can reach apigateway.apollo247.in.
+
+MedPlus is not included: medplusmart.com blocks all non-browser requests
+(Akamai "Access Denied" 403), so it cannot be fetched with plain requests.
+Rather than show fake numbers, only verified live sources are returned.
 """
 
 import os
+import uuid
 import concurrent.futures
 import requests
 from flask import Flask, request, jsonify
@@ -112,9 +117,123 @@ def fetch_pharmeasy(query: str, limit: int = 10):
 
 
 # ---------------------------------------------------------------------------
+# Source: Netmeds
+# ---------------------------------------------------------------------------
+NETMEDS_URL = "https://www.netmeds.com/ext/search/application/api/v1.0/products"
+NETMEDS_PRODUCT_BASE = "https://www.netmeds.com/product/"
+
+
+def _netmeds_quantity(name: str, attrs: dict) -> str:
+    """Build a quantity string like "15 Tablet(s) in Strip" or "150 ml in Bottle"."""
+    size = str(attrs.get("packsize") or "").strip()
+    unit = str(attrs.get("packsizeunit") or "").strip().upper()
+    pack = str(attrs.get("packagetype") or "").strip().title()
+    if not size:
+        return "1 unit"
+    if unit == "ML":
+        qty = f"{size} ml"
+    elif unit in ("GM", "G"):
+        qty = f"{size} g"
+    else:
+        lname = name.lower()
+        if "capsule" in lname:
+            qty = f"{size} Capsule(s)"
+        elif "tablet" in lname:
+            qty = f"{size} Tablet(s)"
+        else:
+            qty = f"{size} units"
+    return f"{qty} in {pack}" if pack else qty
+
+
+def fetch_netmeds(query: str, limit: int = 10):
+    resp = requests.get(
+        NETMEDS_URL,
+        headers=BASE_HEADERS,
+        params={"q": query, "page_size": limit},
+        timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+
+    out = []
+    for p in (payload.get("items") or [])[:limit]:
+        name = (p.get("name") or "").strip()
+        prices = p.get("price") or {}
+        price = (prices.get("effective") or {}).get("min") or (prices.get("marked") or {}).get("min")
+        if not name or not price:
+            continue
+        quantity = _netmeds_quantity(name, p.get("attributes") or {})
+        slug = p.get("slug") or ""
+        link = (NETMEDS_PRODUCT_BASE + slug) if slug else "https://www.netmeds.com"
+        out.append(
+            {"medicine": name, "quantity": quantity, "price": f"\u20b9{price}", "link": link}
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Source: Apollo Pharmacy
+# Uses the same search endpoint and headers that apollopharmacy.in's own
+# search page calls from the browser (no login needed).
+# ---------------------------------------------------------------------------
+APOLLO_URL = "https://apigateway.apollo247.in/search-service/v5/fullSearch"
+APOLLO_SITE = "https://www.apollopharmacy.in"
+APOLLO_PINCODE = os.environ.get("APOLLO_PINCODE", "")
+
+
+def fetch_apollo(query: str, limit: int = 10):
+    headers = dict(BASE_HEADERS)
+    headers.update(
+        {
+            "Content-Type": "application/json",
+            "Origin": APOLLO_SITE,
+            "Referer": APOLLO_SITE + "/",
+            "X-TOKEN": "",
+            "x-app-os": "web",
+            "x-source-service": "PHARMA_AP_IN",
+            "x-unique-session-id": str(uuid.uuid4()),
+        }
+    )
+    body = {
+        "query": query,
+        "page": 1,
+        "productsPerPage": limit,
+        "selSortBy": "relevance",
+        "filters": [],
+        "pincode": APOLLO_PINCODE,
+    }
+    resp = requests.post(APOLLO_URL, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    payload = resp.json()
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+
+    out = []
+    products = (data.get("productDetails") or {}).get("products") or []
+    for p in products[:limit]:
+        name = (p.get("name") or "").strip()
+        price = p.get("specialPrice") or p.get("price")
+        if not name or not price:
+            continue
+        quantity = p.get("unitSize") or "1 unit"
+        url_key = p.get("urlKey") or p.get("url_key") or ""
+        if url_key:
+            # Apollo's site links prescription items to /medicine/ and the rest to /otc/.
+            section = "medicine" if p.get("isPrescriptionRequired") in (1, "1", True) else "otc"
+            link = f"{APOLLO_SITE}/{section}/{url_key}"
+        else:
+            link = APOLLO_SITE
+        out.append(
+            {"medicine": name, "quantity": str(quantity), "price": f"\u20b9{price}", "link": link}
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
 SOURCES = {
     "1mg (Tata)": fetch_1mg,
     "PharmEasy": fetch_pharmeasy,
+    "Netmeds": fetch_netmeds,
+    # "Apollo Pharmacy": fetch_apollo,  # enable after it is verified (see README)
 }
 
 
