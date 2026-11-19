@@ -81,6 +81,9 @@ def fetch_1mg(query: str, limit: int = 10):
         url_path = item.get("url") or ""
         link = (ONEMG_BASE + url_path) if url_path.startswith("/") else (url_path or ONEMG_BASE)
         out.append({"medicine": name, "quantity": quantity, "price": str(price), "link": link})
+        # 1mg ignores per_page and can return 30+ items, so cap like the other sources.
+        if len(out) >= limit:
+            break
     return out
 
 
