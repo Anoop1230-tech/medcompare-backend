@@ -9,7 +9,7 @@ Lightweight Flask API that powers the MedCompare front-end.
 | `1mg (Tata)` | Tata 1mg public search API | Live |
 | `PharmEasy` | PharmEasy public search API | Live |
 | `Netmeds` | Netmeds public search API | Live |
-| `Apollo Pharmacy` | Apollo search API (`fetch_apollo`) | Written, not enabled until verified |
+| `Apollo Pharmacy` | Apollo search API, using the anonymous guest token the site issues to every visitor | Live |
 
 MedPlus is not supported: medplusmart.com blocks non-browser requests (Akamai 403).
 
@@ -28,7 +28,8 @@ Response: an object keyed by pharmacy name. Each value is a list of products:
     { "number": 1, "medicine": "Dolo 650 Tablet", "quantity": "15 units", "price": "₹29.7", "link": "https://www.1mg.com/drugs/..." }
   ],
   "PharmEasy": [ ... ],
-  "Netmeds": [ ... ]
+  "Netmeds": [ ... ],
+  "Apollo Pharmacy": [ ... ]
 }
 ```
 If a source fails or times out, its list is empty and the other sources are still returned.

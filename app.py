@@ -10,10 +10,8 @@ no headless browser required):
 - Tata 1mg public search API      (https://www.1mg.com/pwa-api/...)
 - PharmEasy public search API      (https://pharmeasy.in/api/search/...)
 - Netmeds public search API        (https://www.netmeds.com/ext/search/...)
-
-Apollo Pharmacy: fetch_apollo() calls the search endpoint used by
-apollopharmacy.in's own search page. It is not registered in SOURCES until
-it has been verified from a network that can reach apigateway.apollo247.in.
+- Apollo Pharmacy search API       (https://apigateway.apollo247.in/search-service/...)
+  using the anonymous guest token apollopharmacy.in gives every visitor.
 
 MedPlus is not included: medplusmart.com blocks all non-browser requests
 (Akamai "Access Denied" 403), so it cannot be fetched with plain requests.
@@ -21,7 +19,10 @@ Rather than show fake numbers, only verified live sources are returned.
 """
 
 import os
+import re
+import time
 import uuid
+import threading
 import concurrent.futures
 import requests
 from flask import Flask, request, jsonify
@@ -173,21 +174,65 @@ def fetch_netmeds(query: str, limit: int = 10):
 
 # ---------------------------------------------------------------------------
 # Source: Apollo Pharmacy
-# Uses the same search endpoint and headers that apollopharmacy.in's own
-# search page calls from the browser (no login needed).
+# Uses the same search endpoint that apollopharmacy.in's own search page calls.
+# Requests carry the anonymous "public:read" guest token that the site issues
+# to every visitor (no login). The token is cached until shortly before expiry.
 # ---------------------------------------------------------------------------
 APOLLO_URL = "https://apigateway.apollo247.in/search-service/v5/fullSearch"
+APOLLO_TOKEN_URL = "https://apigateway.apollo247.in/auth-service/accessToken"
 APOLLO_SITE = "https://www.apollopharmacy.in"
 APOLLO_PINCODE = os.environ.get("APOLLO_PINCODE", "")
 
+_apollo_token = {"value": None, "device_id": None, "expires": 0.0}
+_apollo_lock = threading.Lock()
 
-def fetch_apollo(query: str, limit: int = 10):
+
+def _apollo_guest_token(force: bool = False):
+    with _apollo_lock:
+        if not force and _apollo_token["value"] and time.time() < _apollo_token["expires"]:
+            return _apollo_token["value"], _apollo_token["device_id"]
+        resp = requests.get(
+            APOLLO_TOKEN_URL,
+            params={"_nonce": str(uuid.uuid4())},
+            headers={"User-Agent": BASE_HEADERS["User-Agent"], "Origin": APOLLO_SITE, "Referer": APOLLO_SITE + "/"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        ttl_min = data.get("ttlInMinutes") or 60
+        _apollo_token["value"] = data["accessToken"]
+        _apollo_token["device_id"] = data.get("deviceId") or ""
+        # Refresh 10 minutes early so a token never expires mid-request.
+        _apollo_token["expires"] = time.time() + max(60, (ttl_min - 10) * 60)
+        return _apollo_token["value"], _apollo_token["device_id"]
+
+
+def _apollo_quantity(name: str) -> str:
+    """Apollo returns no pack size, so read it from names like "Dolo-650 Tablet 15's"."""
+    lname = name.lower()
+    m = re.search(r"(\d+)\s*'s\b", name, re.I) or re.search(r"(\d+)\s*count\b", name, re.I)
+    if m:
+        if "capsule" in lname:
+            return f"{m.group(1)} Capsule(s)"
+        if "tablet" in lname:
+            return f"{m.group(1)} Tablet(s)"
+        return f"{m.group(1)} units"
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(ml|gm|g|kg|l)\b", name, re.I)
+    if m:
+        unit = {"gm": "g"}.get(m.group(2).lower(), m.group(2).lower())
+        return f"{m.group(1)} {unit}"
+    return "1 unit"
+
+
+def _apollo_search(query: str, limit: int, token: str, device_id: str):
     headers = dict(BASE_HEADERS)
     headers.update(
         {
             "Content-Type": "application/json",
             "Origin": APOLLO_SITE,
             "Referer": APOLLO_SITE + "/",
+            "Authorization": token,
+            "x-device-id": device_id,
             "X-TOKEN": "",
             "x-app-os": "web",
             "x-source-service": "PHARMA_AP_IN",
@@ -202,7 +247,16 @@ def fetch_apollo(query: str, limit: int = 10):
         "filters": [],
         "pincode": APOLLO_PINCODE,
     }
-    resp = requests.post(APOLLO_URL, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+    return requests.post(APOLLO_URL, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+
+
+def fetch_apollo(query: str, limit: int = 10):
+    token, device_id = _apollo_guest_token()
+    resp = _apollo_search(query, limit, token, device_id)
+    if resp.status_code == 401:
+        # Token was revoked or expired early: get a fresh one and retry once.
+        token, device_id = _apollo_guest_token(force=True)
+        resp = _apollo_search(query, limit, token, device_id)
     resp.raise_for_status()
     payload = resp.json()
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
@@ -214,7 +268,7 @@ def fetch_apollo(query: str, limit: int = 10):
         price = p.get("specialPrice") or p.get("price")
         if not name or not price:
             continue
-        quantity = p.get("unitSize") or "1 unit"
+        quantity = p.get("unitSize") or _apollo_quantity(name)
         url_key = p.get("urlKey") or p.get("url_key") or ""
         if url_key:
             # Apollo's site links prescription items to /medicine/ and the rest to /otc/.
@@ -233,7 +287,7 @@ SOURCES = {
     "1mg (Tata)": fetch_1mg,
     "PharmEasy": fetch_pharmeasy,
     "Netmeds": fetch_netmeds,
-    # "Apollo Pharmacy": fetch_apollo,  # enable after it is verified (see README)
+    "Apollo Pharmacy": fetch_apollo,
 }
 
 
