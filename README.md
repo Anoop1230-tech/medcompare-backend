@@ -2,6 +2,17 @@
 
 Lightweight Flask API that powers the MedCompare front-end.
 
+## Live sources
+
+| Source (response key) | Data source | Status |
+|---|---|---|
+| `1mg (Tata)` | Tata 1mg public search API | Live |
+| `PharmEasy` | PharmEasy public search API | Live |
+| `Netmeds` | Netmeds public search API | Live |
+| `Apollo Pharmacy` | Apollo search API (`fetch_apollo`) | Written, not enabled until verified |
+
+MedPlus is not supported: medplusmart.com blocks non-browser requests (Akamai 403).
+
 ## Endpoint
 
 ### `POST /api/scrape`
@@ -13,16 +24,17 @@ Request body:
 Response: an object keyed by pharmacy name. Each value is a list of products:
 ```json
 {
-  "Apollo": [
-    { "number": 1, "medicine": "Dolo 650 Tablet", "quantity": "15 Tablets", "price": "₹30.60", "link": "https://..." }
+  "1mg (Tata)": [
+    { "number": 1, "medicine": "Dolo 650 Tablet", "quantity": "15 units", "price": "₹29.7", "link": "https://www.1mg.com/drugs/..." }
   ],
-  "Netmeds": [ ... ],
-  "1mg": [ ... ]
+  "PharmEasy": [ ... ],
+  "Netmeds": [ ... ]
 }
 ```
+If a source fails or times out, its list is empty and the other sources are still returned.
 
 ### `GET /`
-Health check.
+Health check. Lists the active sources.
 
 ## Run locally
 ```bash
@@ -32,7 +44,18 @@ python app.py
 gunicorn app:app
 ```
 
+## Environment variables
+- `PORT`: port to listen on (default 5000)
+- `ONEMG_CITY`: city sent to 1mg (default `Gurgaon`)
+- `APOLLO_PINCODE`: pincode sent to Apollo (default empty)
+
+## Adding a pharmacy
+1. Write a `fetch_<name>(query, limit=10)` function in `app.py` that returns a list of
+   `{"medicine", "quantity", "price", "link"}` dicts.
+2. Register it in the `SOURCES` dict. The key is the name shown on the website.
+3. Add a chart color for the same name in the front-end `scripts.js` `colors` map.
+
 ## Notes
-This service serves curated sample data filtered by the search query. It
+All sources are fetched with plain HTTP requests in parallel. The service
 intentionally avoids Selenium/headless Chrome, which caused out-of-memory
 failures (HTTP 503) on constrained hosting.
